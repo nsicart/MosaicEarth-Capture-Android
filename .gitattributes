@@ -1,0 +1,2 @@
+gradlew.bat text eol=crlf
+app/src/main/assets/viewer/bundle.js -whitespace linguist-generated=true

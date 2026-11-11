@@ -1,0 +1,372 @@
+openapi: 3.1.0
+info:
+  title: MosaicEarth Capture Mobile API
+  version: 1.0.0-draft.1
+  description: |
+    Proposed Mobile Capture contract for MosaicEarth v2.1. The Android build
+    requires a sandbox origin and does not use the legacy browser processing
+    routes. Requests and responses with credentials or private data must use
+    HTTPS and Cache-Control no-store. Authenticate bearer tokens and apply
+    ownership checks to every private resource. No provider credentials cross
+    this boundary. Production support is subject to separate review.
+servers:
+  - url: /api/v2/capture/v1
+security:
+  - captureBearer: []
+paths:
+  /capabilities:
+    get:
+      security: []
+      operationId: captureCapabilities
+      responses:
+        '200':
+          description: Exact contract and environment. Empty presets means no available processor.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract, environment, presets]
+                properties:
+                  contract: {const: capture-v1}
+                  environment: {const: sandbox}
+                  presets:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, label]
+                      properties:
+                        id: {$ref: '#/components/schemas/Id'}
+                        label: {type: string}
+  /session:
+    post:
+      security: []
+      operationId: captureSession
+      description: Use the existing account directory. Rate limit, issue revocable short-lived capture tokens and verify active accounts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: {type: string, maxLength: 254}
+                password: {type: string, format: password, maxLength: 512}
+      responses:
+        '200':
+          description: Private mobile session.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accountId, displayName, accessToken]
+                properties:
+                  accountId: {$ref: '#/components/schemas/Id'}
+                  displayName: {type: string}
+                  accessToken: {type: string}
+        '401': {description: Invalid credentials}
+        '429': {description: Rate limited}
+    delete:
+      operationId: captureRevokeSession
+      responses:
+        '204': {description: Session revoked}
+  /projects:
+    get:
+      operationId: captureProjects
+      responses:
+        '200':
+          description: Projects owned by the authenticated account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [projects]
+                properties:
+                  projects:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name]
+                      properties:
+                        id: {$ref: '#/components/schemas/Id'}
+                        name: {type: string}
+  /mosaics:
+    get:
+      operationId: captureMosaics
+      responses:
+        '200':
+          description: MyMosaics owned by the authenticated account.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [mosaics]
+                properties:
+                  mosaics:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name]
+                      properties:
+                        id: {$ref: '#/components/schemas/Id'}
+                        name: {type: string}
+  /quotes:
+    post:
+      operationId: captureQuote
+      description: |
+        Server-authoritative estimate for a specific owner, preset, manifest
+        and destination. Enforce image count, file/total size, storage and job
+        limits. Quote is single-use, immutable and expires. Do not convert EUR
+        or plan usage into credits without an explicit server billing policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [files, preset, projectId]
+              properties:
+                files: {$ref: '#/components/schemas/Manifest'}
+                preset: {$ref: '#/components/schemas/Id'}
+                projectId: {$ref: '#/components/schemas/NullableId'}
+      responses:
+        '200':
+          description: Server estimate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quote'
+        '503': {description: No verified sandbox processor or billing policy}
+  /jobs:
+    post:
+      operationId: captureCreateJob
+      description: |
+        Persist consent and a private upload reservation, without charging.
+        Atomically bind owner + key + quote to one job; replay identical input
+        with the same response even after quote expiry. A different payload
+        for an existing key is 422. A cancelled key cannot create a new job.
+      parameters:
+        - $ref: '#/components/parameters/Key'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [files, quoteId, projectId, title, description, scene, visibility, location]
+              properties:
+                files: {$ref: '#/components/schemas/Manifest'}
+                quoteId: {$ref: '#/components/schemas/Id'}
+                projectId: {$ref: '#/components/schemas/NullableId'}
+                title: {type: string, maxLength: 100}
+                description: {type: string, maxLength: 2000}
+                scene: {enum: [OBJECT, SCULPTURE, MONUMENT, FACADE, BUILDING, STREET, OUTDOOR, FREE]}
+                visibility: {const: private}
+                location: {$ref: '#/components/schemas/Location'}
+      responses:
+        '200': {$ref: '#/components/responses/Job'}
+        '410': {description: Quote expired or request cancelled}
+        '422': {description: Quote or idempotency payload mismatch}
+  /jobs/{jobId}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      operationId: captureJob
+      responses:
+        '200': {$ref: '#/components/responses/Job'}
+        '404': {description: Unknown or inaccessible job}
+  /jobs/{jobId}/files/{fileId}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - name: fileId
+        in: path
+        required: true
+        schema: {$ref: '#/components/schemas/Id'}
+    get:
+      operationId: captureUploadOffset
+      responses:
+        '200': {$ref: '#/components/responses/Offset'}
+    put:
+      operationId: captureUploadPart
+      description: |
+        Verify SHA-256 and range before atomically advancing the durable
+        offset. An identical repeated committed block is safe. A conflicting
+        range returns 409. Validate final full-file SHA-256 before accepting
+        the input at submit.
+      parameters:
+        - name: Content-Range
+          in: header
+          required: true
+          schema: {type: string, pattern: '^bytes [0-9]+-[0-9]+/[0-9]+$'}
+        - name: X-Chunk-SHA256
+          in: header
+          required: true
+          schema: {$ref: '#/components/schemas/Sha256'}
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        '200': {$ref: '#/components/responses/Offset'}
+        '409': {description: Conflicting offset. Read the durable offset and retry.}
+        '422': {description: Invalid checksum or file}
+  /jobs/{jobId}/submit:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - $ref: '#/components/parameters/Key'
+    post:
+      operationId: captureSubmit
+      description: |
+        Verify manifest files, owned project, current entitlement, price and
+        quota. Recheck price without increasing the accepted quote. Write
+        one ledger reservation/debit and one dispatch outbox record in a
+        transaction. Deduplicate queue dispatch and settle or release/refund
+        the reservation idempotently according to terminal state and policy.
+      responses:
+        '200': {$ref: '#/components/responses/Job'}
+        '402': {description: Insufficient balance or unsupported billing}
+        '409': {description: Dataset is not completely committed}
+        '422': {description: 'Changed price, invalid input, or key mismatch'}
+  /requests/{requestKey}/cancel:
+    post:
+      operationId: captureCancel
+      parameters:
+        - name: requestKey
+          in: path
+          required: true
+          schema: {$ref: '#/components/schemas/Id'}
+        - $ref: '#/components/parameters/Key'
+      description: |
+        Resolve by owner + original create key. Atomically tombstone unseen
+        keys so cancel can win even when the create response was lost.
+        Check permissions, request engine cancellation where available and
+        settle with the server's stated refund policy.
+      responses:
+        '200': {$ref: '#/components/responses/Job'}
+  /jobs/{jobId}/result:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      operationId: captureDownload
+      description: Stream the immutable private model only after the server Quality Gate succeeds. No redirects.
+      responses:
+        '200':
+          description: Gaussian result in PLY, SPLAT or gzip SPZ v2. Identity transfer encoding and Content-Length are required.
+          headers:
+            Content-Length:
+              required: true
+              schema: {type: integer, minimum: 1}
+            X-Content-SHA256:
+              required: true
+              schema: {$ref: '#/components/schemas/Sha256'}
+            X-Model-Format:
+              required: true
+              schema: {enum: [ply, splat, spz]}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '404': {description: 'Unknown, inaccessible or unreleased result'}
+  /jobs/{jobId}/publication:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - $ref: '#/components/parameters/Key'
+    post:
+      operationId: capturePrivatePublication
+      description: Attach one approved result to the owner's MyEarth project and, optionally, one owned MyMosaic. Deduplicate replays.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [visibility, mosaicId]
+              properties:
+                visibility: {const: private}
+                mosaicId: {$ref: '#/components/schemas/NullableId'}
+      responses:
+        '200':
+          description: Private MyEarth result and optional MyMosaic link.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assetId, projectId]
+                properties:
+                  assetId: {$ref: '#/components/schemas/Id'}
+                  projectId: {$ref: '#/components/schemas/Id'}
+components:
+  securitySchemes:
+    captureBearer: {type: http, scheme: bearer}
+  parameters:
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/Id'}
+    Key:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {$ref: '#/components/schemas/Id'}
+  responses:
+    Job:
+      description: Persisted private job state.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Job'}
+    Offset:
+      description: Contiguous bytes durably stored.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [offset]
+            properties:
+              offset: {type: integer, format: int64, minimum: 0}
+  schemas:
+    Id: {type: string, pattern: '^[A-Za-z0-9_-]{1,128}$'}
+    NullableId:
+      oneOf:
+        - $ref: '#/components/schemas/Id'
+        - type: 'null'
+    Sha256: {type: string, pattern: '^[a-f0-9]{64}$'}
+    Manifest:
+      type: array
+      minItems: 2
+      items:
+        type: object
+        required: [id, size, sha256, contentType]
+        properties:
+          id: {$ref: '#/components/schemas/Id'}
+          size: {type: integer, format: int64, minimum: 1}
+          sha256: {$ref: '#/components/schemas/Sha256'}
+          contentType: {const: image/jpeg}
+    Quote:
+      type: object
+      required: [quoteId, engine, preset, estimatedCredits, balance, conditions, expiresAtMillis]
+      properties:
+        quoteId: {$ref: '#/components/schemas/Id'}
+        engine: {type: string}
+        preset: {$ref: '#/components/schemas/Id'}
+        estimatedCredits: {type: integer, minimum: 0}
+        balance: {type: integer, minimum: 0}
+        conditions: {type: string}
+        expiresAtMillis: {type: integer, format: int64}
+    Job:
+      type: object
+      required: [state, progress, finalCredits]
+      properties:
+        jobId: {$ref: '#/components/schemas/Id'}
+        state: {enum: [UPLOADING, QUEUED, PROCESSING, QUALITY_GATE, READY, FAILED, CANCELLED, REJECTED]}
+        progress: {type: integer, minimum: 0, maximum: 100}
+        finalCredits: {type: [integer, 'null'], minimum: 0}
+    Location:
+      type: object
+      required: [mode]
+      properties:
+        mode: {enum: [LOCAL, GPS_APPROXIMATE, MANUALLY_PLACED]}
+        latitude: {type: number, minimum: -90, maximum: 90}
+        longitude: {type: number, minimum: -180, maximum: 180}
+        horizontalAccuracy: {type: number, minimum: 0}
+        observedAtMillis: {type: integer, format: int64}
